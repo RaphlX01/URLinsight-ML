@@ -1,0 +1,9 @@
+Skenario,Model,Accuracy,Precision,Recall,F1-Score
+S1 (Phi -> Phi),Random Forest,0.9939,0.9927,0.9967,0.9947
+S1 (Phi -> Phi),Logistic Regression,0.9716,0.9555,0.9969,0.9758
+S2 (Legit -> Legit),Random Forest,0.998,0.92,0.7753,0.8415
+S2 (Legit -> Legit),Logistic Regression,0.9934,0.5862,0.191,0.2881
+S3 (Phi -> Legit),Random Forest,0.9931,0.8889,0.018,0.0352
+S3 (Phi -> Legit),Logistic Regression,0.9935,0.7059,0.1079,0.1871
+S4 (Legit -> Phi),Random Forest,0.7714,0.9452,0.638,0.7618
+S4 (Legit -> Phi),Logistic Regression,0.4213,0.0,0.0,0.0

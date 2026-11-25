@@ -1,7 +1,14 @@
+﻿# Environment & Secrets
 venv/
+.env
 __pycache__/
-data/raw/
-data/processed/
-models/
-*.joblib
-*.pkl
+*.py[cod]
+
+# Dataset CSV besar (cukup simpan lokal)
+data/raw/*.csv
+data/processed/*.csv
+
+# IDE & OS
+.vscode/
+.DS_Store
+Thumbs.db

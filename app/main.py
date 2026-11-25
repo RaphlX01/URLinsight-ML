@@ -1,124 +1,217 @@
-from fastapi import FastAPI, HTTPException, Depends, status
+﻿import os
+import sys
+import uuid
+import time
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+import joblib
+import numpy as np
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-import joblib
-import math
-import time
-import uuid
-from datetime import datetime, timezone
-from collections import Counter
-from urllib.parse import urlparse
 
-app = FastAPI(title="URLinsight ML Service")
-SECRET_TOKEN = "urlinsight-secret-token-2026"
-security = HTTPBearer()
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if credentials.credentials != SECRET_TOKEN:
-        raise HTTPException(status_code=401, detail="Invalid Token")
-    return credentials.credentials
+from src.preprocessing import is_valid_url
+from src.features import FEATURE_ORDER, FEATURE_DESCRIPTIONS, build_indicators
 
-# Load Model
+load_dotenv()
+
+API_TOKEN = os.getenv("URLINSIGHT_API_TOKEN", "urlinsight-secret-token-2026")
+MODEL_PATH = os.getenv(
+    "URLINSIGHT_MODEL_PATH",
+    os.path.join(ROOT_DIR, "models", "rf_v1.0.0.joblib"),
+)
+
+app = FastAPI(
+    title="URLinsight ML Service",
+    version="1.0.0",
+    description="REST API Deteksi URL Phishing dengan SHAP Local Explainability",
+)
+
+security = HTTPBearer(auto_error=False)
+model_bundle = None
+
 try:
-    model = joblib.load("models/rf_baseline.joblib")
-except Exception:
-    model = None
+    if os.path.exists(MODEL_PATH):
+        model_bundle = joblib.load(MODEL_PATH)
+except Exception as exc:
+    print(f"[STARTUP ERROR] Gagal memuat model: {exc}")
+    model_bundle = None
+
 
 class PredictRequest(BaseModel):
     url: str
 
-def shannon_entropy(s):
-    if not s: return 0.0
-    n = len(s)
-    return -sum(c / n * math.log2(c / n) for c in Counter(s).values())
 
-def extract_features(url):
-    url = str(url)
-    host = urlparse(url).netloc
-    return [
-        len(url), url.count("."), sum(ch.isdigit() for ch in url),
-        int(url.startswith("https://")), len(host), shannon_entropy(url)
+def error_response(status_code: int, code: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "success": False,
+            "error": {
+                "code": code,
+                "message": message,
+            },
+        },
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return error_response(
+        400,
+        "INVALID_REQUEST",
+        "Body request harus JSON valid dan memiliki field 'url'",
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    if isinstance(exc.detail, dict) and "code" in exc.detail:
+        return error_response(exc.status_code, exc.detail["code"], exc.detail["message"])
+    return error_response(exc.status_code, "INTERNAL_ERROR", str(exc.detail))
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    return error_response(500, "INTERNAL_ERROR", "Terjadi kesalahan internal pada ML Service")
+
+
+def verify_bearer_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if (
+        credentials is None
+        or credentials.scheme.lower() != "bearer"
+        or credentials.credentials != API_TOKEN
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "UNAUTHORIZED",
+                "message": "Bearer Token tidak ada atau tidak valid",
+            },
+        )
+    return credentials.credentials
+
+
+def compute_shap_explanation(
+    explainer, feature_vec: list, indicators: list[dict], prediction: str
+) -> dict:
+    x_arr = np.array([feature_vec], dtype=float)
+    raw_shap = explainer.shap_values(x_arr)
+
+    if isinstance(raw_shap, list):
+        phishing_contrib = np.array(raw_shap[1])[0]
+    elif raw_shap.ndim == 3:
+        phishing_contrib = raw_shap[0, :, 1]
+    else:
+        phishing_contrib = raw_shap[0]
+
+    indicator_values = {item["name"]: item["value"] for item in indicators}
+    ranked = sorted(
+        zip(FEATURE_ORDER, phishing_contrib),
+        key=lambda item: abs(item[1]),
+        reverse=True,
+    )
+
+    top_features = []
+    for feat_name, contrib in ranked[:3]:
+        val = indicator_values[feat_name]
+        direction = "phishing" if contrib > 0 else "legitimate"
+        top_features.append(
+            {
+                "name": feat_name,
+                "value": val,
+                "contribution": round(float(abs(contrib)), 4),
+                "direction": direction,
+            }
+        )
+
+    supporting = [
+        f"{FEATURE_DESCRIPTIONS[item['name']].lower()} ({item['value']})"
+        for item in top_features
+        if item["direction"] == prediction
     ]
+    if supporting:
+        summary = f"Prediksi {prediction} terutama dipengaruhi oleh {', '.join(supporting)}."
+    else:
+        summary = f"Prediksi {prediction} didasarkan pada kombinasi keseluruhan struktur teks URL."
+
+    return {
+        "method": "SHAP",
+        "summary": summary,
+        "top_features": top_features,
+    }
+
+
+@app.get("/health")
+def health():
+    if model_bundle is None:
+        return error_response(503, "MODEL_UNAVAILABLE", "Model belum siap atau tidak tersedia")
+    return {
+        "success": True,
+        "status": "ready",
+        "model_version": model_bundle["version"],
+    }
+
 
 @app.post("/api/v1/predict")
-def predict(req: PredictRequest, token: str = Depends(verify_token)):
-    start_time = time.time()
-    
-    if not req.url.strip():
-        return JSONResponse(status_code=422, content={"success": False, "error": {"code": "INVALID_URL", "message": "URL invalid"}})
-    if model is None:
-        return JSONResponse(status_code=503, content={"success": False, "error": {"code": "MODEL_UNAVAILABLE", "message": "Model offline"}})
+def predict(req: PredictRequest, _token: str = Depends(verify_bearer_token)):
+    start_time = time.perf_counter()
 
-    try:
-        # Ekstraksi & Prediksi
-        fitur = extract_features(req.url)
-        prediksi = int(model.predict([fitur])[0])
-        probabilitas = model.predict_proba([fitur])[0]
-        confidence = float(max(probabilitas))
-        label = "phishing" if prediksi == 1 else "legitimate"
-        
-        # --- LOGIKA RISK LEVEL ---
-        risk_level = "low"
-        if label == "phishing":
-            risk_level = "high" if confidence > 0.8 else "medium"
-        elif label == "legitimate":
-            risk_level = "low"
-            confidence = float(probabilitas[0]) # Ambil probabilitas legit
+    if model_bundle is None:
+        return error_response(503, "MODEL_UNAVAILABLE", "Model belum siap atau tidak tersedia")
 
-        # --- FORMAT INDICATORS (Persis minta temanmu) ---
-        indicators = [
-            {
-                "name": "url_length",
-                "value": fitur[0],
-                "interpretation": "Relatif panjang" if fitur[0] > 75 else "Normal",
-                "severity": "low" # Temanmu minta 'low' di contoh ini
+    valid, result = is_valid_url(req.url)
+    if not valid:
+        return error_response(422, "INVALID_URL", result)
+
+    normalized_url = result
+    domain = urlparse(normalized_url).hostname or ""
+
+    feature_vec, indicators = build_indicators(normalized_url)
+    model = model_bundle["model"]
+    label_map = model_bundle["label_map"]
+
+    pred_idx = int(model.predict([feature_vec])[0])
+    proba = model.predict_proba([feature_vec])[0]
+
+    prediction_label = label_map[pred_idx]
+    confidence = round(float(proba[pred_idx]), 4)
+
+    explanation = compute_shap_explanation(
+        model_bundle["explainer"], feature_vec, indicators, prediction_label
+    )
+
+    elapsed_ms = int(round((time.perf_counter() - start_time) * 1000))
+    analyzed_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    return {
+        "success": True,
+        "data": {
+            "scan_id": uuid.uuid4().hex[:8],
+            "target": {
+                "url": normalized_url,
+                "domain": domain,
             },
-            {
-                "name": "subdomain_count",
-                "value": max(0, fitur[1] - 1),
-                "interpretation": "Memiliki beberapa subdomain" if fitur[1] > 2 else "Normal",
-                "severity": "medium"
+            "classification": {
+                "prediction": prediction_label,
+                "confidence": confidence,
             },
-            {
-                "name": "uses_https",
-                "value": bool(fitur[3]),
-                "interpretation": "Menggunakan HTTPS" if fitur[3] == 1 else "Tidak menggunakan HTTPS",
-                "severity": "info"
-            }
-        ]
-
-        processing_time = int((time.time() - start_time) * 1000)
-        analyzed_at = datetime.now(timezone.utc).isoformat()
-
-        # --- RETURN JSON PERSIS SEPERTI REQUEST ---
-        return {
-            "success": True,
-            "data": {
-                "scan_id": str(uuid.uuid4())[:8],
-                "target": {
-                    "url": req.url,
-                    "domain": urlparse(req.url).netloc
-                },
-                "classification": {
-                    "prediction": label,
-                    "confidence": round(confidence, 2), # Dibuat 2 desimal biar kayak 0.97
-                    "risk_level": risk_level
-                },
-                "analysis": {
-                    "indicators": indicators,
-                    "explanation": {
-                        "method": "SHAP",
-                        "summary": f"Beberapa karakteristik URL berkontribusi terhadap prediksi {label}.",
-                        "top_features": [] # Dikosongkan sesuai request dia
-                    }
-                },
-                "metadata": {
-                    "model_version": "1.0.0",
-                    "processing_time_ms": processing_time,
-                    "analyzed_at": analyzed_at
-                }
-            }
-        }
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"success": False, "error": {"code": "INTERNAL_ERROR", "message": str(e)}})
+            "analysis": {
+                "indicators": indicators,
+                "explanation": explanation,
+            },
+            "metadata": {
+                "model_version": model_bundle["version"],
+                "processing_time_ms": elapsed_ms,
+                "analyzed_at": analyzed_at,
+            },
+        },
+    }

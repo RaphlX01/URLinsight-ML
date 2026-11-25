@@ -1,0 +1,29 @@
+{
+  "model_version": "1.0.0",
+  "features": [
+    "url_length",
+    "dot_count",
+    "digit_count",
+    "uses_https",
+    "domain_length",
+    "url_entropy",
+    "hostname_is_ip",
+    "subdomain_count",
+    "has_hyphen_in_domain",
+    "special_char_count",
+    "suspicious_keyword_count",
+    "has_risky_tld"
+  ],
+  "metrics": {
+    "accuracy": 0.9604,
+    "precision_phishing": 0.9869,
+    "recall_phishing": 0.9399,
+    "f1_phishing": 0.9628
+  },
+  "confusion_matrix": {
+    "TP": 30576,
+    "FP": 407,
+    "TN": 26649,
+    "FN": 1954
+  }
+}
